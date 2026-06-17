@@ -111,6 +111,34 @@ typedef struct xqEventQueue {
 /* X core keyboard codes are scan code + this offset (the classic evdev/X +8). */
 #define SVR4XQ_KEYCODE_OFFSET 8
 
+/* The ws driver has different keycodes for the E0 extended block than what
+ * evdev expects. Translate them. */
+typedef struct {
+    unsigned char scan;
+    unsigned char evdev_code;
+} svr4xq_keycode_translation_entry;
+
+static const svr4xq_keycode_translation_entry svr4xq_keycode_translations[] = {
+    { 0x48, 111}, /* Up arrow */
+    { 0x4B, 113 }, /* Left arrow */
+    { 0x4D, 114 }, /* Right arrow */
+    { 0x50, 116 }, /* Down arrow */
+    { 0x47, 110 }, /* Home */
+    { 0x4F, 115 }, /* End */
+    { 0x49, 112 }, /* Page Up */
+    { 0x51, 117 }, /* Page Down */
+    { 0x52, 118 }, /* Insert */
+    { 0x53, 119 }, /* Delete */
+    { 0x1D, 105 }, /* Right Control */
+    { 0x38, 108 }, /* Right Alt */
+    { 0x35, 106 }, /* Keypad / */
+    { 0x1C, 104 }, /* Keypad Enter */
+    { 0x37, 107 }, /* Print Screen */
+    { 0x5B, 133 }, /* Left Super */
+    { 0x5C, 134 }, /* Right Super */
+    { 0x5D, 135 }, /* Menu */
+};
+
 static const char *const svr4xq_default_device_paths[] = {
     "/dev/kd/kdvm00", "/dev/vt00", "/dev/syscon", "/dev/console"
 };
@@ -463,7 +491,7 @@ svr4xq_close_device(void)
 #define SVR4XQ_CLOCAL_DEBUGCON_WRITE 1
 #endif
 #ifndef SVR4XQ_DEBUG
-#define SVR4XQ_DEBUG 0
+#define SVR4XQ_DEBUG 1
 #endif
 
 static int svr4xq_debug = SVR4XQ_DEBUG;
@@ -498,7 +526,7 @@ svr4xq_dispatch_key(unsigned char code)
 {
     InputInfoPtr kbd = svr4xq_shared.keyboard;
     int is_down;
-    unsigned int keycode;
+    unsigned int keycode = 0;
 
     /*
      * 0xE0 is an extended-key prefix (right ctrl/alt, arrows, etc.). It arrives
@@ -511,6 +539,7 @@ svr4xq_dispatch_key(unsigned char code)
      */
     if (code == 0xE0) {
         svr4xq_shared.prefix_e0 = 1;
+        svr4xq_dbgf("svr4xq: received E0 prefix\n");
         return;
     }
     if (code == 0xE1)
@@ -522,11 +551,31 @@ svr4xq_dispatch_key(unsigned char code)
     is_down = (code & KBD_BREAK) ? 0 : 1;
     keycode = (unsigned int)(code & ~KBD_BREAK);
     if (svr4xq_shared.prefix_e0) {
-        keycode += 0x60;
         svr4xq_shared.prefix_e0 = 0;
-    }
-    keycode += SVR4XQ_KEYCODE_OFFSET;
 
+        // Consult our translation table for the E0 extended block.
+        for (size_t i = 0; i < sizeof(svr4xq_keycode_translations) /
+            sizeof(svr4xq_keycode_translations[0]); ++i) {
+            svr4xq_dbgf("svr4xq: checking translation table entry %zu: scan=0x%02X evdev=%u\n",
+                        i, svr4xq_keycode_translations[i].scan, svr4xq_keycode_translations[i].evdev_code);
+            if (svr4xq_keycode_translations[i].scan == keycode) {
+                keycode = svr4xq_keycode_translations[i].evdev_code;
+                break;
+            }
+        }
+
+        if(keycode == 0) {
+            // If not found, log and ignore the event.
+            svr4xq_dbgf("svr4xq: missing translation for E0 block scancode "
+                "0x%02X, ignoring\n", code);
+            return;
+        }
+        svr4xq_dbgf("svr4xq: translated E0 block scancode 0x%02X to evdev code %u\n",
+                    code, keycode);
+    } else {
+        // evdev scancodes for the non-extended keys match AT set-1 + 8.
+        keycode += SVR4XQ_KEYCODE_OFFSET;
+    }
     xf86PostKeyboardEvent(kbd->dev, keycode, is_down);
 }
 
@@ -703,7 +752,7 @@ svr4xq_drain(void)
         xqEvent ev = ((xqEvent *)q->xq_events)[q->xq_head];
         q->xq_head = (q->xq_head + 1) % size;
 
-        if (svr4xq_debug && ev.xq_type != XQ_KEY) {
+        if (svr4xq_debug) {
             svr4xq_dbgf(
                 "svr4xq: ev type=%d code=0x%02x x=%d y=%d (head=%d tail=%d)\n",
                 ev.xq_type, ev.xq_code, (int)ev.xq_x, (int)ev.xq_y,
@@ -712,6 +761,7 @@ svr4xq_drain(void)
 
         switch (ev.xq_type) {
         case XQ_KEY:
+            svr4xq_dbgf("svr4xq: dispatch key code=0x%02x\n", ev.xq_code);
             svr4xq_dispatch_key(ev.xq_code);
             break;
         case XQ_MOTION:
