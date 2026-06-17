@@ -491,7 +491,7 @@ svr4xq_close_device(void)
 #define SVR4XQ_CLOCAL_DEBUGCON_WRITE 1
 #endif
 #ifndef SVR4XQ_DEBUG
-#define SVR4XQ_DEBUG 1
+#define SVR4XQ_DEBUG 0
 #endif
 
 static int svr4xq_debug = SVR4XQ_DEBUG;
