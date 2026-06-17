@@ -1,11 +1,17 @@
 #include "xorg-server.h"
 
+/* TEMP: horizontal-scale probe pattern (no slow ISABugger spins).  Remove. */
+/* #define SVR4WS_TESTPATTERN 0 */
+/* TEMP: ISABugger register readbacks (CR1B, SR07, geometry inputs).  Remove. */
+/* #define SVR4WS_DIAGNOSTICS 0 */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <bits/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -46,8 +52,7 @@
 #define SVR4WS_BYTES_PER_PIXEL (SVR4WS_BPP / 8)
 #define SVR4WS_FRAMEBUFFER_STRIDE (SVR4WS_WIDTH * SVR4WS_BYTES_PER_PIXEL)
 #define SVR4WS_FRAMEBUFFER_SIZE (SVR4WS_HEIGHT * SVR4WS_FRAMEBUFFER_STRIDE)
-#define SVR4WS_PLANES 4
-#define SVR4WS_HW_COLORS 0
+#define SVR4WS_HW_COLORS 256
 #define SVR4WS_COLORMAP_ENTRIES 256
 
 #define SYS_CLOCAL 127
@@ -75,15 +80,94 @@
 
 #define KD_GRAPHICS 1
 
+/*
+ * The graphics-mode memory map is the single 64 KB window at A0000 (graphics
+ * register GR06 bits [3:2] = 01, banked_mask = 0xffff).  In single-bank mode
+ * (GR0B bit 0 = 0) the whole 64 KB window is addressed by the GR09 offset
+ * register, which with GR0B bit 5 set has 16 KB granularity.  So GR09 must
+ * advance by four (4 x 16 KB = 64 KB) to step the window by one full aperture,
+ * and the bank base is therefore 64 KB-aligned.
+ */
 #define SVR4WS_BANK_APERTURE (64 * 1024)
 #define SVR4WS_BANK_GRANULARITY (16 * 1024)
 
 #define CIRRUS_SR07_BPP_SVGA 0x01
 #define CIRRUS_SR07_BPP_16 0x06
-#define CIRRUS_SR07_ISAADDR_A0000 0x80
+/*
+ * IMPORTANT: SR07 bits [7:4] are NOT a harmless pixel/aperture tweak -- a
+ * nonzero high nibble selects the high-memory *linear* framebuffer aperture
+ * and DISABLES the A0000 banked window that this driver writes through.  We
+ * drive the chip purely via the A0000 64 KB bank window (GR09), so SR07's high
+ * nibble must stay zero.  The full 16bpp value is therefore just
+ * SVGA (bit 0) | BPP_16 (bits 2:1) = 0x07.
+ *
+ * (cirrusfb uses SR07 = 0xa7 because it sets up the linear aperture instead;
+ * mixing its SR07 value with banked writes is what left the screen showing
+ * un-written VRAM.)
+ */
+#define CIRRUS_SR07_16BPP_BANKED (CIRRUS_SR07_BPP_SVGA | CIRRUS_SR07_BPP_16)
 #define CIRRUS_SR0F_MEMSIZE_1M 0x10
 #define CIRRUS_SR0F_BANKSWITCH 0x80
-#define CIRRUS_HIDDEN_DAC_565 0x01
+
+/*
+ * Cirrus chip identification.  The chip family is read back from CRTC index
+ * 0x27 (the chip-ID register).  These are the values 86Box and real silicon
+ * report.  We only need to know whether the part supports 16bpp HiColor.
+ */
+#define CIRRUS_CRTC_CHIPID 0x27
+#define CIRRUS_ID_GD5420 0x8a
+#define CIRRUS_ID_GD5422 0x8c
+#define CIRRUS_ID_GD5424 0x94
+#define CIRRUS_ID_GD5426 0x90
+#define CIRRUS_ID_GD5428 0x98
+#define CIRRUS_ID_GD5429 0x9c
+#define CIRRUS_ID_GD5430 0xa0
+#define CIRRUS_ID_GD5434 0xa8
+#define CIRRUS_ID_GD5436 0xac
+#define CIRRUS_ID_GD5446 0xb8
+/* The chip-ID register reports the family in bits [7:2]; mask off the rev. */
+#define CIRRUS_CHIPID_MASK 0xfc
+
+/*
+ * CRTC extension register 0x1b.  It carries the offset-overflow bit, the
+ * display-start overflow bits, and two control bits that must be set for a
+ * correct HiColor scanout:
+ *   bit 1 (0x02): use the full video-memory display mask (otherwise the
+ *                 emulated/real scanout is clamped to 256 KB, which wraps an
+ *                 800x600x16 frame into repeating bands).
+ *   bit 5 (0x20): extended blanking (required on GD5424 and later).
+ * cirrusfb writes 0x22 for every mode; we do the same, ORing in the offset
+ * overflow bit only when the pitch exceeds 8 bits.
+ */
+#define CIRRUS_CRTC_EXT 0x1b
+#define CIRRUS_CR1B_BASE 0x22
+#define CIRRUS_CR1B_OFFSET8 0x10
+/*
+ * Hidden DAC (port 0x3c6) value for 16bpp 5-6-5.  The high nibble 0xc0
+ * enables the extended/packed-pixel HiColor modes on real GD542x silicon;
+ * the low nibble selects the pixel format (0 = 5-5-5, 1 = 5-6-5).  Emulators
+ * decode only the low nibble, but real hardware requires the 0xc0 enable.
+ */
+#define CIRRUS_HIDDEN_DAC_565 0xc1
+
+/*
+ * VCLK0 programming for a 40 MHz pixel clock (standard 800x600 @ 60 Hz dot
+ * clock, in-spec for the GD5426/5428 HiColor limit of ~45 MHz).
+ *
+ * The four VCLKs are programmed through sequencer numerator registers
+ * SR0B..SR0E and denominator registers SR1B..SR1E, where SR0B/SR1B is VCLK0,
+ * ... SR0E/SR1E is VCLK3.  The MISC clock-select bits [3:2] choose the active
+ * VCLK; the egatab sets them to 00 = VCLK0, so we must program SR0B/SR1B
+ * (NOT SR0E/SR1E, which is VCLK3 and was the cause of the chip falling back to
+ * its fixed 25.175 MHz default).
+ *
+ *   VCLK = 14.31818 MHz * num / (den * mul)
+ * The denominator byte is (den << 1) | (mul == 2 ? 1 : 0); num is 7 bits and
+ * den is only 5 bits.  num = 42 (0x2a), den = 15, mul = 1 ->
+ * 14.31818 * 42 / 15 = 40.09 MHz.
+ */
+#define CIRRUS_SR0B_VCLK0_NUM 0x2a
+#define CIRRUS_SR1B_VCLK0_DEN ((15 << 1) | 0)
 
 #ifndef HW_SKIP_CONSOLE
 #define HW_SKIP_CONSOLE 4
@@ -154,15 +238,43 @@ struct kd_custom_mode {
 typedef enum {
     OPTION_DEVICE,
     OPTION_VT,
-    OPTION_MODE
+    OPTION_MODE,
+    OPTION_CHIPSET
 } SVR4WSOption;
 
 static const OptionInfoRec SVR4WSOptions[] = {
     { OPTION_DEVICE, "Device", OPTV_STRING, {0}, FALSE },
     { OPTION_VT, "VT", OPTV_STRING, {0}, FALSE },
     { OPTION_MODE, "Mode", OPTV_STRING, {0}, FALSE },
+    { OPTION_CHIPSET, "Chipset", OPTV_STRING, {0}, FALSE },
     { -1, NULL, OPTV_NONE, {0}, FALSE }
 };
+
+/*
+ * Per-chip description.  hicolor is FALSE for the GD5420/5422, which are
+ * 8bpp-only and cannot drive this driver's hardcoded 16bpp mode.
+ */
+typedef struct {
+    const char *name;
+    unsigned char id;       /* CRTC 0x27 value, masked with CIRRUS_CHIPID_MASK */
+    Bool hicolor;
+} SVR4WSChipInfo;
+
+static const SVR4WSChipInfo svr4ws_chips[] = {
+    { "GD5420", CIRRUS_ID_GD5420 & CIRRUS_CHIPID_MASK, FALSE },
+    { "GD5422", CIRRUS_ID_GD5422 & CIRRUS_CHIPID_MASK, FALSE },
+    { "GD5424", CIRRUS_ID_GD5424 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5426", CIRRUS_ID_GD5426 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5428", CIRRUS_ID_GD5428 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5429", CIRRUS_ID_GD5429 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5430", CIRRUS_ID_GD5430 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5434", CIRRUS_ID_GD5434 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5436", CIRRUS_ID_GD5436 & CIRRUS_CHIPID_MASK, TRUE },
+    { "GD5446", CIRRUS_ID_GD5446 & CIRRUS_CHIPID_MASK, TRUE },
+};
+
+/* Default assumption when detection is unavailable: a GD5429-class part. */
+#define SVR4WS_DEFAULT_CHIP 5
 
 typedef struct {
     int vt_fd;
@@ -185,11 +297,17 @@ typedef struct {
     Bool (*ShadowFBInit)(ScreenPtr pScreen, RefreshAreaFuncPtr refreshArea);
     const char *device_path;
     const char *vt_path;
+    const char *chipset_name;       /* Xorg "Chipset" override, or NULL */
+    const SVR4WSChipInfo *chip;     /* selected chip description */
 } SVR4WSRec, *SVR4WSPtr;
 
 #define SVR4WSPTR(p) ((SVR4WSPtr)((p)->driverPrivate))
 
-static const unsigned short svr4ws_vga_io_ports[] = { 0x3c4, 0x3c5, 0x3ce, 0x3cf, 0x3c8, 0x3c9 };
+static const unsigned short svr4ws_vga_io_ports[] = {
+    0x3c4, 0x3c5, 0x3ce, 0x3cf, 0x3c8, 0x3c9, 0x3c6, 0x3d4, 0x3d5,
+    /* 86Box ISABugger diagnostic card (index 0x7a, data 0x7b). */
+    0x7a, 0x7b
+};
 
 static const char *const svr4ws_default_vt_paths[] = { "/dev/vt00", "/dev/tty", "/dev/syscon", "/dev/console" };
 static const char *const svr4ws_default_device_paths[] = { "/dev/kd/kdvm00", "/dev/video" };
@@ -397,6 +515,51 @@ SVR4WSWriteVGARegister(unsigned short index_port, unsigned short data_port, unsi
     SVR4WSWritePort8(data_port, value);
 }
 
+/*
+ * Diagnostics via the 86Box ISABugger card (index port 0x7a, data port 0x7b).
+ * Compiled out unless SVR4WS_DIAGNOSTICS is defined, because the readout spin
+ * (and the standalone test pattern) badly slow X startup under 86Box.  Build
+ * with -DSVR4WS_DIAGNOSTICS to re-enable them.
+ *   - red LEDs   (reg 0x00): a "stage" tag so you know which value is shown
+ *   - green LEDs (reg 0x01): the reported value, in binary
+ *   - 7-seg displays (reg 0x02 right, 0x04 left): the reported value, in hex
+ */
+#ifdef SVR4WS_DIAGNOSTICS
+#define SVR4WS_BUGGER_INDEX 0x7a
+#define SVR4WS_BUGGER_DATA 0x7b
+
+static void
+SVR4WSBuggerWrite(unsigned char reg, unsigned char value)
+{
+    SVR4WSWritePort8(SVR4WS_BUGGER_INDEX, reg);
+    SVR4WSWritePort8(SVR4WS_BUGGER_DATA, value);
+}
+
+static void
+SVR4WSBuggerReport(unsigned char stage, unsigned char value)
+{
+    volatile unsigned long spin;
+
+    SVR4WSBuggerWrite(0x00, stage);          /* red LEDs: which value this is */
+    SVR4WSBuggerWrite(0x01, value);          /* green LEDs: value in binary */
+    SVR4WSBuggerWrite(0x02, value);          /* right 7-seg: value low nibble pair */
+    SVR4WSBuggerWrite(0x04, value);          /* left 7-seg: same byte */
+
+    /* Hold the value on the displays long enough to read (~1-2s of busy spin). */
+    for (spin = 0; spin < 200000000UL; ++spin)
+        __asm__ __volatile__("" ::: "memory");
+}
+#else
+#define SVR4WSBuggerReport(stage, value) ((void)0)
+#endif
+
+static unsigned char
+SVR4WSReadVGARegister(unsigned short index_port, unsigned short data_port, unsigned char index)
+{
+    SVR4WSWritePort8(index_port, index);
+    return SVR4WSReadPort8(data_port);
+}
+
 static void
 SVR4WSSetVGAPlaneMask(unsigned char plane_mask)
 {
@@ -423,6 +586,73 @@ SVR4WSSetCirrusHiddenDAC(unsigned char value)
     (void)SVR4WSReadPort8(0x3c6);
     (void)SVR4WSReadPort8(0x3c6);
     SVR4WSWritePort8(0x3c6, value);
+}
+
+static const SVR4WSChipInfo *
+SVR4WSChipByName(const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(svr4ws_chips) / sizeof(svr4ws_chips[0]); ++i) {
+        if (strcasecmp(name, svr4ws_chips[i].name) == 0)
+            return &svr4ws_chips[i];
+    }
+    return NULL;
+}
+
+static const SVR4WSChipInfo *
+SVR4WSChipById(unsigned char id)
+{
+    size_t i;
+
+    id &= CIRRUS_CHIPID_MASK;
+    for (i = 0; i < sizeof(svr4ws_chips) / sizeof(svr4ws_chips[0]); ++i) {
+        if (svr4ws_chips[i].id == id)
+            return &svr4ws_chips[i];
+    }
+    return NULL;
+}
+
+/*
+ * Resolve which Cirrus chip we are driving.  A "Chipset" option in the Xorg
+ * config always wins; otherwise we read the chip-ID register (CRTC 0x27) and
+ * match it against the table.  Requires VGA I/O to already be enabled.
+ * Falls back to the GD5429-class default if nothing matches.
+ */
+static void
+SVR4WSDetectChip(ScrnInfoPtr pScrn)
+{
+    SVR4WSPtr fPtr = SVR4WSPTR(pScrn);
+    unsigned char raw;
+    const SVR4WSChipInfo *chip;
+
+    if (fPtr->chipset_name) {
+        chip = SVR4WSChipByName(fPtr->chipset_name);
+        if (chip) {
+            fPtr->chip = chip;
+            xf86DrvMsg(pScrn->scrnIndex, X_CONFIG,
+                "using configured Cirrus chipset %s\n", chip->name);
+            return;
+        }
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+            "unknown configured chipset '%s'; auto-detecting\n", fPtr->chipset_name);
+    }
+
+    /* Unlock the Cirrus extensions so the chip-ID register reads back. */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x06, 0x12);
+    raw = SVR4WSReadVGARegister(0x3d4, 0x3d5, CIRRUS_CRTC_CHIPID);
+    chip = SVR4WSChipById(raw);
+    if (chip) {
+        fPtr->chip = chip;
+        xf86DrvMsg(pScrn->scrnIndex, X_PROBED,
+            "detected Cirrus %s (CR27=0x%02x)\n", chip->name, raw);
+        return;
+    }
+
+    fPtr->chip = &svr4ws_chips[SVR4WS_DEFAULT_CHIP];
+    xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+        "unrecognized Cirrus chip-ID 0x%02x; assuming %s\n",
+        raw, fPtr->chip->name);
 }
 
 static Bool
@@ -552,6 +782,8 @@ SVR4WSRestoreTextMode(ScrnInfoPtr pScrn)
         SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x06, 0x12);
         /* Disable packed-pixel mode */
         SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x07, 0x00);
+        /* Restore the CRTC extension register to its standard-VGA state */
+        SVR4WSWriteVGARegister(0x3d4, 0x3d5, CIRRUS_CRTC_EXT, 0x00);
         /* Disable extensions control */
         SVR4WSWriteVGARegister(0x3ce, 0x3cf, 0x0b, 0x00);
         /* Clear bank offsets */
@@ -613,6 +845,17 @@ SVR4WSRefreshArea(ScrnInfoPtr pScrn, int count, BoxPtr boxes)
 
     if (!logged) {
         SVR4WSDebug("svr4ws: RefreshArea");
+#ifdef SVR4WS_DIAGNOSTICS
+        /*
+         * Stage 7: highest bank index this refresh reaches.  The last scanline
+         * of a full 800x600x16 frame lands at byte 599*1600 -> bank 0x3a, so
+         * ~0x3a means banking reaches the whole frame.
+         */
+        {
+            size_t last = (size_t)(SVR4WS_HEIGHT - 1) * (size_t)fPtr->framebuffer_stride;
+            SVR4WSBuggerReport(7, (unsigned char)(last / SVR4WS_BANK_GRANULARITY));
+        }
+#endif
         logged = 1;
     }
     SVR4WSDebugRefresh(count, boxes);
@@ -645,6 +888,12 @@ SVR4WSRefreshArea(ScrnInfoPtr pScrn, int count, BoxPtr boxes)
             remaining = (size_t)(x2 - x1) * SVR4WS_BYTES_PER_PIXEL;
 
             while (remaining) {
+                /*
+                 * The 64 KB window is anchored on a 64 KB boundary; GR09 holds
+                 * that base in 16 KB-granularity units (so it is a multiple of
+                 * four).  The byte position inside the window is the low 16
+                 * bits of the offset.
+                 */
                 size_t bank_base = offset & ~((size_t)SVR4WS_BANK_APERTURE - 1U);
                 int bank = (int)(bank_base / SVR4WS_BANK_GRANULARITY);
                 size_t bank_offset = offset - bank_base;
@@ -750,6 +999,13 @@ SVR4WSPreInit(ScrnInfoPtr pScrn, int flags)
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "only depth 16 / bpp 16 is supported\n");
         return FALSE;
     }
+    /*
+     * This driver hardcodes a 16-bpp HiColor mode.  Only the Cirrus GD5426 and
+     * later (GD5428/5429/5434, ...) implement HiColor; the GD5420 and GD5422
+     * are 8-bpp only and cannot drive this mode.
+     */
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+        "16-bpp HiColor mode requires a GD5426 or later Cirrus chip\n");
     if (!xf86SetWeight(pScrn, default_weight, default_mask))
         return FALSE;
 
@@ -767,6 +1023,12 @@ SVR4WSPreInit(ScrnInfoPtr pScrn, int flags)
     xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, fPtr->options);
     fPtr->device_path = xf86GetOptValString(fPtr->options, OPTION_DEVICE);
     fPtr->vt_path = xf86GetOptValString(fPtr->options, OPTION_VT);
+    fPtr->chipset_name = xf86GetOptValString(fPtr->options, OPTION_CHIPSET);
+    if (fPtr->chipset_name && !SVR4WSChipByName(fPtr->chipset_name)) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+            "configured Chipset '%s' is not recognized; will auto-detect\n",
+            fPtr->chipset_name);
+    }
     {
         const char *configured_mode = xf86GetOptValString(fPtr->options, OPTION_MODE);
         if (configured_mode && strcmp(configured_mode, "cirrus800x600x16") != 0) {
@@ -832,6 +1094,16 @@ SVR4WSEnterVT(VT_FUNC_ARGS_DECL)
         SVR4WSRestoreTextMode(pScrn);
         return FALSE;
     }
+
+    if (!fPtr->chip)
+        SVR4WSDetectChip(pScrn);
+    if (!fPtr->chip->hicolor) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+            "Cirrus %s does not support 16-bpp HiColor; this driver requires "
+            "a GD5424 or later part\n", fPtr->chip->name);
+        SVR4WSRestoreTextMode(pScrn);
+        return FALSE;
+    }
     {
         struct kd_custom_mode custom_mode = {
             SVR4WS_WIDTH, SVR4WS_HEIGHT, 0, SVR4WS_FRAMEBUFFER_SIZE,
@@ -839,11 +1111,37 @@ SVR4WSEnterVT(VT_FUNC_ARGS_DECL)
             {
                 {0x00, 0x00, 0x00, 0x00, 0x00},
                 {0x01, 0x0f, 0x00, 0x0e},
-                0x2f,
+                /*
+                 * MISC: clock-select bits [3:2] = 00 select VCLK0, which we
+                 * program below to 40 MHz.  (Was 0x2f, selecting VCLK3 with
+                 * its ~50 MHz default -> wrong refresh and an out-of-spec
+                 * HiColor dot clock.)
+                 */
+                0x23,
                 {
-                    0x7b, 0x63, 0x64, 0x9e, 0x69, 0x92, 0x6f, 0xf0,
+                    /*
+                     * CRTC, indices 0x00-0x18.  Horizontal total (CR00) is
+                     * 0x83 -> (0x83 + 5) = 132 char clocks = 1056 px, the
+                     * standard 800x600 @ 60 Hz htotal.  Underline location
+                     * (CR14, 0x00) clears the doubleword (DW) addressing bit.
+                     *
+                     * CR17 (0xe3) selects BYTE addressing via bit 6 (0x40).
+                     * This is essential: 86Box's svga_recalc_remap_func derives
+                     * the scanout address remap from CR17/CR14 and applies it
+                     * even to packed-pixel HiColor modes.  With bit 6 clear the
+                     * chip is in WORD mode (CR17 bit 5 set -> VAR_WORD_MODE_MA15)
+                     * and the linear 16-bpp framebuffer is read with the VGA
+                     * word-mode address rotation (addr<<1 | MA15->MA2), which
+                     * scrambles the image into the diagonal/sheared "sectioned"
+                     * pattern.  QEMU ignores CR17 byte/word mode in SVGA modes
+                     * and reads linearly, which is why the bug only shows on
+                     * 86Box.  Byte mode (bit 6 = 1) makes remap_required false
+                     * -> linear scanout.  Other bits kept: 0x80 sync enable,
+                     * 0x20 address wrap, 0x03 compatibility/CMS.
+                     */
+                    0x83, 0x63, 0x64, 0x9e, 0x69, 0x92, 0x6f, 0xf0,
                     0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x58, 0x8a, 0x57, 0xc8, 0x40, 0x58, 0x6f, 0xa3, 0xff
+                    0x58, 0x8a, 0x57, 0xc8, 0x00, 0x58, 0x6f, 0xe3, 0xff
                 },
                 {
                     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
@@ -879,14 +1177,119 @@ SVR4WSEnterVT(VT_FUNC_ARGS_DECL)
     }
     /* Unlock Cirrus Logic extensions */
     SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x06, 0x12);
-    /* Enable 16-bpp packed-pixel SVGA mode at the A0000 aperture. */
-    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x07,
-        CIRRUS_SR07_ISAADDR_A0000 | CIRRUS_SR07_BPP_SVGA | CIRRUS_SR07_BPP_16);
+    /*
+     * Force SR01 (clocking mode) to 8 dots per character clock.  Bit 3 selects
+     * 16 dots/clock; if it is left set, the chip generates twice as many pixels
+     * per scanline as the CRTC width implies, so an 800-px line is scanned out
+     * as 1600 px and the image tiles twice horizontally with a staircase shear.
+     * Bit 0 = 8-dot characters; all other bits clear for a plain SVGA line.
+     */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x01, 0x01);
+    /*
+     * Program VCLK0 to 40 MHz so the MISC clock-select (set to VCLK0 in the
+     * egatab) drives the correct 800x600 @ 60 Hz dot clock.  This dot clock is
+     * within the GD5426/5428 16-bpp limit of ~45 MHz.
+     */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x0b, CIRRUS_SR0B_VCLK0_NUM);
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x1b, CIRRUS_SR1B_VCLK0_DEN);
+    /* Enable 16-bpp packed-pixel SVGA mode, keeping the A0000 banked window. */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x07, CIRRUS_SR07_16BPP_BANKED);
     SVR4WSSetCirrusHiddenDAC(CIRRUS_HIDDEN_DAC_565);
     SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x0f,
         CIRRUS_SR0F_MEMSIZE_1M | CIRRUS_SR0F_BANKSWITCH);
-    /* Configure single bank mode with 16KB granularity */
+    /*
+     * Program the CRTC extension register.  Without bit 1 the display scanout
+     * is clamped to 256 KB and an 800x600x16 (937 KB) frame wraps into
+     * repeating bands; bit 5 selects the extended blanking required on the
+     * GD5424 and later.  Our pitch (CR13 = 200) fits in 8 bits, so the offset
+     * overflow bit is not needed.
+     */
+    SVR4WSWriteVGARegister(0x3d4, 0x3d5, CIRRUS_CRTC_EXT, CIRRUS_CR1B_BASE);
+    /*
+     * Force CR17 byte addressing (bit 6).  The egatab already sets CR17 = 0xe3,
+     * but re-assert it here so the scanout address remap stays linear no matter
+     * what the kernel mode-switch left behind.  In word mode (bit 6 clear) the
+     * 16-bpp framebuffer is read with the VGA word-mode rotation and shears; see
+     * the egatab CRTC comment and 86Box svga_recalc_remap_func for the detail.
+     */
+    SVR4WSWriteVGARegister(0x3d4, 0x3d5, 0x17, 0xe3);
+    /*
+     * Single-bank mode (GR0B bit 0 = 0) with 16 KB granularity (bit 5 = 1).
+     * The A0000 window is the 64 KB aperture driven by GR09.
+     */
     SVR4WSWriteVGARegister(0x3ce, 0x3cf, 0x0b, 0x20);
+    /*
+     * Re-assert SR01 = 8 dots/clock immediately before the final SR07 write.
+     * 86Box recomputes the display geometry on every SR07 write
+     * (gd54xx_recalctimings) and from it derives hdisp = (CR01+1) * (SR01 bit 3
+     * ? 16 : 8) and a linedbl heuristic (dispend*9/10 >= hdisp).  If SR01 bit 3
+     * were set here, hdisp would read as 1600, linedbl would flip, and 86Box
+     * would select the line-doubled 16bpp renderer (svga_render_16bpp_lowres):
+     * each scanline drawn twice, half the content, producing the staircase
+     * shear with vertical duplication.  QEMU has no such heuristic and renders
+     * the packed framebuffer linearly regardless, which is why this only bites
+     * on 86Box.  Re-writing SR01 here guarantees the geometry latched by the
+     * final recalc below uses 8 dots/clock no matter what the kernel egatab or
+     * an intervening SR07/SR0F write left behind.
+     */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x01, 0x01);
+    /*
+     * Re-write SR07 last so the chip re-evaluates the memory map and display
+     * timings with every register now in its final state (an SR07 write forces
+     * that re-evaluation; CR1B and GR0B do not).  This keeps the A0000 banked
+     * window mapped now that GR0B's granularity bit is set.
+     */
+    SVR4WSWriteVGARegister(0x3c4, 0x3c5, 0x07, CIRRUS_SR07_16BPP_BANKED);
+
+    /*
+     * ISABugger diagnostics: read back the registers that actually drive the
+     * pixel format so we can see what stuck.  Stage tag is on the red LEDs.
+     *   1: CR27 chip id   (expect 0x9c on a GD5429)
+     *   2: SR07 readback  (expect 0x07: SVGA + 16bpp, banked window kept)
+     *   3: CR1B readback  (expect 0x22: full vram mask + ext blanking)
+     *   4: hidden DAC readback (expect 0xc1: HiColor 565)
+     */
+#ifdef SVR4WS_DIAGNOSTICS
+    SVR4WSBuggerReport(1, SVR4WSReadVGARegister(0x3d4, 0x3d5, CIRRUS_CRTC_CHIPID));
+    SVR4WSBuggerReport(2, SVR4WSReadVGARegister(0x3c4, 0x3c5, 0x07));
+    SVR4WSBuggerReport(3, SVR4WSReadVGARegister(0x3d4, 0x3d5, CIRRUS_CRTC_EXT));
+    {
+        unsigned char dac;
+        (void)SVR4WSReadPort8(0x3c6);
+        (void)SVR4WSReadPort8(0x3c6);
+        (void)SVR4WSReadPort8(0x3c6);
+        dac = SVR4WSReadPort8(0x3c6);
+        SVR4WSBuggerReport(4, dac);
+    }
+    /*
+     * Geometry inputs 86Box feeds into its hdisp/dispend/linedbl heuristic.
+     * If the staircase+duplication persists, these reveal which one is wrong:
+     *   8: SR01 (expect 0x01: bit 3 clear -> 8 dots/clock -> hdisp = 800)
+     *   9: CR01 horizontal display end (expect 0x63 -> (0x63+1)*8 = 800)
+     *  10: CR07 overflow   (expect 0xf0: bit 6 set -> dispend |= 0x200 -> 600)
+     *  11: CR12 vertical display end low byte (expect 0x57 -> 87, +512+1 = 600)
+     */
+    SVR4WSBuggerReport(8,  SVR4WSReadVGARegister(0x3c4, 0x3c5, 0x01));
+    SVR4WSBuggerReport(9,  SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x01));
+    SVR4WSBuggerReport(10, SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x07));
+    SVR4WSBuggerReport(11, SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x12));
+    /*
+     * Pitch (CR13/CR1B) and interlace (CR1A) — the scanout stride.  86Box uses
+     * rowoffset = CR13 | ((CR1B & 0x10) << 4), then displayed stride =
+     * rowoffset << 3.  For 800x600x16 we need rowoffset = 200 (0xc8) ->
+     * stride 1600.  A wrong CR13 here is a pure horizontal shear.
+     *  12: CR13 offset/pitch  (expect 0xc8 = 200)
+     *  13: CR1A               (expect 0x00: bit 0 clear -> not interlaced)
+     */
+    SVR4WSBuggerReport(12, SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x13));
+    SVR4WSBuggerReport(13, SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x1a));
+    /*
+     * 14: CR17 (expect 0xe3: bit 6 set -> byte addressing -> linear scanout).
+     * If this reads back without bit 6, 86Box selects a word/dword address
+     * remap and the framebuffer shears.
+     */
+    SVR4WSBuggerReport(14, SVR4WSReadVGARegister(0x3d4, 0x3d5, 0x17));
+#endif
 
     if (ioctl(fPtr->kd_fd, KDSETMODE, KD_GRAPHICS) < 0) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "KDSETMODE KD_GRAPHICS failed: %s\n", strerror(errno));
@@ -897,6 +1300,49 @@ SVR4WSEnterVT(VT_FUNC_ARGS_DECL)
         SVR4WSRestoreTextMode(pScrn);
         return FALSE;
     }
+#ifdef SVR4WS_DIAGNOSTICS
+    /* Stage 5/6: low/high byte of the kernel-reported aperture size. */
+    SVR4WSBuggerReport(5, (unsigned char)(fPtr->framebuffer_size & 0xff));
+    SVR4WSBuggerReport(6, (unsigned char)((fPtr->framebuffer_size >> 8) & 0xff));
+#endif
+
+#ifdef SVR4WS_TESTPATTERN
+    /*
+     * Diagnostic test pattern, written straight into VRAM through the same
+     * banked path RefreshArea uses, bypassing X/ShadowFB entirely.  It is a
+     * horizontal-scale probe: each row is split into quarters by x, coloured
+     *   x  0-199 : red      x 200-399 : green
+     *   x 400-599: blue     x 600-799 : white
+     * If the horizontal scale is 1:1 we see four equal vertical stripes
+     * red|green|blue|white across the full width.  If the image tiles 2x we
+     * see those four stripes twice (eight stripes); the pattern thus reads off
+     * the exact horizontal scale factor directly.
+     */
+    if (fPtr->framebuffer) {
+        static const unsigned short quarters[4] = { 0xf800, 0x07e0, 0x001f, 0xffff };
+        int current_bank = -1;
+        int row;
+
+        for (row = 0; row < SVR4WS_HEIGHT; ++row) {
+            size_t offset = (size_t)row * (size_t)fPtr->framebuffer_stride;
+            int col;
+
+            for (col = 0; col < SVR4WS_WIDTH; ++col, offset += SVR4WS_BYTES_PER_PIXEL) {
+                unsigned short colour = quarters[(col * 4) / SVR4WS_WIDTH];
+                size_t bank_base = offset & ~((size_t)SVR4WS_BANK_APERTURE - 1U);
+                int bank = (int)(bank_base / SVR4WS_BANK_GRANULARITY);
+                size_t bank_offset = offset - bank_base;
+
+                if (bank != current_bank) {
+                    SVR4WSSetCirrusBank(bank);
+                    current_bank = bank;
+                }
+                *(volatile unsigned short *)(fPtr->framebuffer + bank_offset) = colour;
+            }
+        }
+    }
+#endif
+
     pScrn->vtSema = TRUE;
     return TRUE;
 }
